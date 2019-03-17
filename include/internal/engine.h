@@ -38,7 +38,8 @@ struct engine {
 struct dma_gl_texture {
   struct engine* engine;
   GLuint texture;
-  EGLImageKHR image;
+  EGLImageKHR image[2];
+  bool current;
   int (*update_callback)(struct dma_gl_texture*);
   void (*destroy_callback)(struct dma_gl_texture*);
   union {

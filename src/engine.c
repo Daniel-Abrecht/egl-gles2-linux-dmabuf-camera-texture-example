@@ -205,7 +205,12 @@ GLuint engine_create_shader_program(GLuint shaders[]){
 }
 
 
-static int device_init_get_dmabuf(int fd, struct v4l2_format* fmt){
+struct dma_buffers {
+  int fd[2];
+  struct v4l2_format fmt;
+};
+
+static int device_init_get_dmabuf(int fd, struct dma_buffers* result){
 
   {
     struct v4l2_capability cap;
@@ -244,28 +249,35 @@ static int device_init_get_dmabuf(int fd, struct v4l2_format* fmt){
     }
   }
 
-  memset(fmt,0,sizeof(*fmt));
-  fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  memset(&result->fmt,0,sizeof(result->fmt));
+  result->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-  if(ioctl(fd, VIDIOC_G_FMT, fmt) == -1){
+  if(ioctl(fd, VIDIOC_G_FMT, &result->fmt) == -1){
     perror("VIDIOC_G_FMT failed (now trying VIDIOC_S_FMT)");
     return -1;
   }
 
-  unsigned int min = fmt->fmt.pix.width * 2;
-  if (fmt->fmt.pix.bytesperline < min)
-    fmt->fmt.pix.bytesperline = min;
-  min = fmt->fmt.pix.bytesperline * fmt->fmt.pix.height;
-  if (fmt->fmt.pix.sizeimage < min)
-    fmt->fmt.pix.sizeimage = min;
+  unsigned int min = result->fmt.fmt.pix.width * 2;
+  if(result->fmt.fmt.pix.bytesperline < min)
+    result->fmt.fmt.pix.bytesperline = min;
+  min = result->fmt.fmt.pix.bytesperline * result->fmt.fmt.pix.height;
+  if(result->fmt.fmt.pix.sizeimage < min)
+    result->fmt.fmt.pix.sizeimage = min;
 
+  int count = 0;
   {
     struct v4l2_requestbuffers reqbuf;
     memset(&reqbuf, 0, sizeof(reqbuf));
     reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     reqbuf.memory = V4L2_MEMORY_MMAP;
-    reqbuf.count = 1;
-    if(ioctl(fd, VIDIOC_REQBUFS, &reqbuf) == -1){
+    reqbuf.count = 2;
+    int res;
+    res = ioctl(fd, VIDIOC_REQBUFS, &reqbuf);
+    if(res == -1 && errno == EINVAL){
+      reqbuf.count = 1;
+      res = ioctl(fd, VIDIOC_REQBUFS, &reqbuf);
+    }
+    if(res == -1){
       if(errno == EINVAL){
         fprintf(stderr, "Video capturing or DMABUF streaming is not supported\n");
       }else{
@@ -273,19 +285,25 @@ static int device_init_get_dmabuf(int fd, struct v4l2_format* fmt){
       }
       return -1;
     }
+    count = reqbuf.count;
+  }
+  if(count > 2)
+    count = 2;
+
+  for(int i=0; i<count; i++){
+    struct v4l2_exportbuffer expbuf;
+    memset(&expbuf, 0, sizeof(expbuf));
+    expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    expbuf.index = i;
+    expbuf.flags = O_RDONLY;
+    if(ioctl(fd, VIDIOC_EXPBUF, &expbuf) == -1){
+      perror("VIDIOC_EXPBUF");
+      return -1;
+    }
+    result->fd[i] = expbuf.fd;
   }
 
-  struct v4l2_exportbuffer expbuf;
-  memset(&expbuf, 0, sizeof(expbuf));
-  expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  expbuf.index = 0;
-  expbuf.flags = O_RDONLY;
-  if(ioctl(fd, VIDIOC_EXPBUF, &expbuf) == -1){
-    perror("VIDIOC_EXPBUF");
-    return -1;
-  }
-
-  return expbuf.fd;
+  return 0;
 }
 
 static int start_capturing(int fd){
@@ -337,25 +355,38 @@ static int init(struct engine* engine, int argc, char* argv[]){
 }
 
 // TODO: generalise format & make public
-static struct dma_gl_texture* engine_dma_texture_create(struct engine* engine, int dma, struct v4l2_format* fmt){
+static struct dma_gl_texture* engine_dma_texture_create(struct engine* engine, const struct dma_buffers* dma){
   struct dma_gl_texture* dgt = calloc(1, sizeof(struct dma_gl_texture));
   if(!dgt){
     perror("calloc failed");
     goto error;
   }
   dgt->autoupdate = true;
-  dgt->image = eglCreateImageKHR(engine->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)0, (EGLint[]){
-    EGL_WIDTH, fmt->fmt.pix.width,
-    EGL_HEIGHT, fmt->fmt.pix.height,
-    EGL_LINUX_DRM_FOURCC_EXT, fmt->fmt.pix.pixelformat,
-    EGL_DMA_BUF_PLANE0_FD_EXT, dma,
+  dgt->image[0] = eglCreateImageKHR(engine->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)0, (EGLint[]){
+    EGL_WIDTH, dma->fmt.fmt.pix.width,
+    EGL_HEIGHT, dma->fmt.fmt.pix.height,
+    EGL_LINUX_DRM_FOURCC_EXT, dma->fmt.fmt.pix.pixelformat,
+    EGL_DMA_BUF_PLANE0_FD_EXT, dma->fd[0],
     EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, // No bound checks in drm intel driver in kernel (4.14.90) !?!
-    EGL_DMA_BUF_PLANE0_PITCH_EXT, fmt->fmt.pix.bytesperline,
+    EGL_DMA_BUF_PLANE0_PITCH_EXT, dma->fmt.fmt.pix.bytesperline,
     EGL_NONE
   });
-  if( dgt->image == EGL_NO_IMAGE_KHR ){
+  if( dgt->image[0] == EGL_NO_IMAGE_KHR ){
     fprintf(stderr,"eglCreateImageKHR failed\n");
     goto error_after_calloc;
+  }
+  if(dma->fd[1] != -1){ // If this fails, we jus don't have double buffering, so not a big deal
+    dgt->image[1] = eglCreateImageKHR(engine->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)0, (EGLint[]){
+      EGL_WIDTH, dma->fmt.fmt.pix.width,
+      EGL_HEIGHT, dma->fmt.fmt.pix.height,
+      EGL_LINUX_DRM_FOURCC_EXT, dma->fmt.fmt.pix.pixelformat,
+      EGL_DMA_BUF_PLANE0_FD_EXT, dma->fd[1],
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0, // No bound checks in drm intel driver in kernel (4.14.90) !?!
+      EGL_DMA_BUF_PLANE0_PITCH_EXT, dma->fmt.fmt.pix.bytesperline,
+      EGL_NONE
+    });
+  }else{
+    dgt->image[1] = EGL_NO_IMAGE_KHR;
   }
   while(glGetError() != GL_NO_ERROR); // Clear error flags
   glGenTextures(1, &dgt->texture);
@@ -367,7 +398,7 @@ static struct dma_gl_texture* engine_dma_texture_create(struct engine* engine, i
   glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 /*  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);*/
-  glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, dgt->image);
+  glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, dgt->image[0]);
   if(glGetError() != GL_NO_ERROR){
     fprintf(stderr,"creating gl texture failed\n");
     goto error_after_gen_textures;
@@ -380,7 +411,9 @@ static struct dma_gl_texture* engine_dma_texture_create(struct engine* engine, i
 error_after_gen_textures:
   glDeleteTextures(1, &dgt->texture);
 error_after_create_image:
-  eglDestroyImageKHR(engine->display, dgt->image);
+  if(dgt->image[1] != EGL_NO_IMAGE_KHR)
+    eglDestroyImageKHR(engine->display, dgt->image[1]);
+  eglDestroyImageKHR(engine->display, dgt->image[0]);
 error_after_calloc:
   free(dgt);
 error:
@@ -399,7 +432,9 @@ void engine_dma_texture_destroy(struct dma_gl_texture* dgt){
   if(dgt->destroy_callback)
     dgt->destroy_callback(dgt);
   glDeleteTextures(1, &dgt->texture);
-  eglDestroyImageKHR(dgt->engine->display, dgt->image);
+  if(dgt->image[1] != EGL_NO_IMAGE_KHR)
+    eglDestroyImageKHR(dgt->engine->display, dgt->image[1]);
+  eglDestroyImageKHR(dgt->engine->display, dgt->image[0]);
   memset(dgt, 0, sizeof(*dgt));
   free(dgt);
 }
@@ -446,19 +481,34 @@ int v4l_dma_update(struct dma_gl_texture* dgt){
   memset(&buf, 0, sizeof(buf));
   buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   buf.memory = V4L2_MEMORY_MMAP;
-  buf.index = 0;
+  buf.index = dgt->image[1] != EGL_NO_IMAGE_KHR && !dgt->current;
 
   if(ioctl(dev, VIDIOC_QUERYBUF, &buf) == -1){
     perror("VIDIOC_QUERYBUF");
     return -1;
   }
 
+  bool swapped = false;
   if(buf.flags & V4L2_BUF_FLAG_DONE){
+    if(dgt->image[1] != EGL_NO_IMAGE_KHR){
+      dgt->current = !dgt->current;
+      swapped = true;
+    }
     if(ioctl(dev, VIDIOC_DQBUF, &buf) == -1){
-      perror("VIDIOC_QBUF");
+      perror("VIDIOC_DQBUF");
       return -1;
     }
+    if(swapped)
+      glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, dgt->image[dgt->current]);
     ret = 1;
+  }
+
+  if(swapped){
+    buf.index = !dgt->current;
+    if(ioctl(dev, VIDIOC_QUERYBUF, &buf) == -1){
+      perror("VIDIOC_QUERYBUF");
+      return -1;
+    }
   }
 
   if(!(buf.flags & V4L2_BUF_FLAG_QUEUED)){
@@ -473,9 +523,10 @@ int v4l_dma_update(struct dma_gl_texture* dgt){
 
 struct dma_gl_texture* engine_v4l_texture_create(struct engine* engine, const char* v4l_device){
   struct dma_gl_texture* result = 0;
-  struct v4l2_format fmt;
+  struct dma_buffers dma = {
+    .fd = {-1, -1}
+  };
   int dev = -1;
-  int dma = -1;
 
   dev = open_device(v4l_device);
   if(dev == -1){
@@ -483,8 +534,7 @@ struct dma_gl_texture* engine_v4l_texture_create(struct engine* engine, const ch
     goto error;
   }
 
-  dma = device_init_get_dmabuf(dev, &fmt);
-  if(dma == -1){
+  if(device_init_get_dmabuf(dev, &dma) == -1){
     fprintf(stderr,"device_init_get_dmabuf failed\n");
     goto error;
   }
@@ -494,7 +544,7 @@ struct dma_gl_texture* engine_v4l_texture_create(struct engine* engine, const ch
     goto error;
   }
 
-  result = engine_dma_texture_create(engine, dma, &fmt);
+  result = engine_dma_texture_create(engine, &dma);
   if(!result){
     fprintf(stderr,"failed to create texture from dma buffer\n");
     goto error;
@@ -504,12 +554,14 @@ struct dma_gl_texture* engine_v4l_texture_create(struct engine* engine, const ch
   result->destroy_callback = v4l_dma_destroy;
   result->update_param.vlong = dev;
 
-  close(dma);
+  close(dma.fd[0]);
+  close(dma.fd[1]);
 
   return result;
 
 error:
-  close(dma);
+  close(dma.fd[0]);
+  close(dma.fd[1]);
   close(dev);
   engine_dma_texture_destroy(result);
   return 0;
